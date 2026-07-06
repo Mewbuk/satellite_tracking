@@ -15,7 +15,12 @@ import math
 import os
 import numpy as np
 from astropy.io import fits
+from astropy.coordinates import SkyCoord
+from astropy.wcs import WCS
+from astropy.wcs.utils import fit_wcs_from_points
+import astropy.units as u
 from scipy.ndimage import median_filter, convolve, binary_closing
+from scipy.spatial import cKDTree
 from skimage.draw import line as draw_line
 from skimage.measure import label, regionprops
 from skimage.transform import rescale
@@ -187,37 +192,193 @@ def save_png(out_path, data, stars, compact, angle_deg):
     plt.close(fig)
 
 
-def plate_solve(stars, width, height, api_key=None,
-                scale_low=None, scale_high=None, scale_units="arcsecperpix",
-                center_ra=None, center_dec=None, radius=None,
-                solve_timeout=600, retries=3):
-    """Plate-solve from the star centroids via nova.astrometry.net (retries on drop)."""
-    from astroquery.astrometry_net import AstrometryNet
-    from astropy.wcs import WCS
+# ======================================================================
+# PLATE SOLVING — offline, via Gaia DR3 pattern matching (no astrometry.net)
+# Ported from star_catalog_pipeline_3_1.ipynb: build a rough WCS from the
+# header pointing centre + plate scale, query Gaia DR3, lock rotation/flip/
+# shift by matching the star pattern to Gaia, then least-squares refine.
+# The detected "stars" here are trail centroids (satellite-tracked frame);
+# their relative geometry is a rigid transform of the Gaia field at mid-
+# exposure, so pattern matching still works and the WCS is valid at mid-exp.
+# ======================================================================
+
+PLATE_SOLVE_CFG = dict(
+    gaia_maglimit      = 16.0,   # faintest Gaia G to fetch
+    gaia_radius_factor = 0.9,    # cone radius = factor * FOV (deg)
+    n_match_stars      = 60,     # brightest detected stars used for pattern voting
+    n_match_gaia       = 120,    # brightest Gaia stars used for pattern voting
+    len_tol_px         = 2.0,    # pair-length tolerance when voting rotation
+    rot_bin_deg        = 0.5,    # rotation-vote bin size
+    coarse_tol_px      = 3.0,    # inlier tolerance at the coarse stage
+    min_matches        = 8,      # minimum matched stars to trust the solve
+)
+
+
+def read_center(hdr):
+    """Approximate pointing centre from the header (OBJCTRA/DEC, RA/DEC, or CRVAL)."""
+    if hdr.get("OBJCTRA") and hdr.get("OBJCTDEC"):
+        return SkyCoord(str(hdr["OBJCTRA"]), str(hdr["OBJCTDEC"]),
+                        unit=(u.hourangle, u.deg))
+    if hdr.get("RA") is not None and hdr.get("DEC") is not None:
+        ra = str(hdr["RA"]); unit = u.hourangle if (":" in ra or " " in ra.strip()) else u.deg
+        return SkyCoord(ra, str(hdr["DEC"]), unit=(unit, u.deg))
+    if hdr.get("CRVAL1") is not None and hdr.get("CRVAL2") is not None:
+        return SkyCoord(float(hdr["CRVAL1"]) * u.deg, float(hdr["CRVAL2"]) * u.deg)
+    raise ValueError("No pointing centre in header (need OBJCTRA/DEC, RA/DEC, or CRVAL1/2).")
+
+
+def plate_scale_arcsec(hdr):
+    """arcsec/pixel from pixel pitch XPIXSZ (µm) and FOCALLEN (mm)."""
+    pix_um = float(hdr.get("XPIXSZ", 0.0)); fl_mm = float(hdr.get("FOCALLEN", 0.0))
+    if pix_um <= 0 or fl_mm <= 0:
+        raise ValueError("Need XPIXSZ (µm) and FOCALLEN (mm) in the header to compute the scale.")
+    return 206.265 * pix_um / fl_mm
+
+
+def make_wcs(center, scale, nx, ny, theta_deg=0.0, flip=False):
+    """Initial TAN WCS from centre + scale. `flip` negates the first CD column
+    (a proper reflection, det -1), not a skew."""
+    s = scale / 3600.0; th = np.deg2rad(theta_deg); sx = -1.0 if flip else 1.0
+    cd = np.array([[sx * s * np.cos(th), -s * np.sin(th)],
+                   [sx * s * np.sin(th),  s * np.cos(th)]])
+    w = WCS(naxis=2)
+    w.wcs.crpix = [(nx + 1) / 2, (ny + 1) / 2]
+    w.wcs.crval = [center.ra.deg, center.dec.deg]
+    w.wcs.ctype = ["RA---TAN", "DEC--TAN"]; w.wcs.cd = cd
+    return w
+
+
+def query_gaia(center, fov_deg, cfg):
+    """Gaia DR3 cone query around the approximate centre."""
+    from astroquery.gaia import Gaia
+    r = cfg["gaia_radius_factor"] * fov_deg
+    q = (f"SELECT ra, dec, phot_g_mean_mag FROM gaiadr3.gaia_source "
+         f"WHERE 1=CONTAINS(POINT('ICRS',ra,dec),"
+         f"CIRCLE('ICRS',{center.ra.deg},{center.dec.deg},{r})) "
+         f"AND phot_g_mean_mag < {cfg['gaia_maglimit']} ORDER BY phot_g_mean_mag")
+    t = Gaia.launch_job_async(q).get_results()
+    return SkyCoord(np.array(t["ra"]) * u.deg, np.array(t["dec"]) * u.deg)
+
+
+def _pair_vecs(xy):
+    i, j = np.triu_indices(len(xy), k=1); v = xy[j] - xy[i]
+    return np.hypot(v[:, 0], v[:, 1]), np.arctan2(v[:, 1], v[:, 0])
+
+
+def coarse_align(det, cat, cfg):
+    """Vote rotation + flip + shift that best overlays the detection pattern on Gaia."""
+    dL, dA = _pair_vecs(det); best = None
+    abin = np.deg2rad(cfg["rot_bin_deg"]); ltol = cfg["len_tol_px"]; tol = cfg["coarse_tol_px"]
+    for flip in (False, True):
+        C = cat * np.array([-1.0, 1.0]) if flip else cat
+        cL, cA = _pair_vecs(C); order = np.argsort(cL); cLs = cL[order]
+        lo = np.searchsorted(cLs, dL - ltol); hi = np.searchsorted(cLs, dL + ltol)
+        votes = []
+        for p in range(len(dL)):
+            qa = cA[order[lo[p]:hi[p]]]
+            votes.append(dA[p] - qa); votes.append(dA[p] - qa + np.pi)
+        if not votes:
+            continue
+        votes = np.mod(np.concatenate(votes), 2 * np.pi)
+        hist, edges = np.histogram(votes, bins=int(2 * np.pi / abin), range=(0, 2 * np.pi))
+        for pk in np.argsort(hist)[-6:]:
+            ang = edges[pk] + abin / 2
+            R = np.array([[np.cos(ang), -np.sin(ang)], [np.sin(ang), np.cos(ang)]])
+            RC = (R @ C.T).T
+            shifts = (det[:, None, :] - RC[None, :, :]).reshape(-1, 2)
+            key = np.round(shifts / tol).astype(int)
+            uniq, cnt = np.unique(key, axis=0, return_counts=True)
+            t = uniq[np.argmax(cnt)] * tol
+            d, _ = cKDTree(RC + t).query(det, k=1)
+            n = int((d < tol).sum())
+            if best is None or n > best[0]:
+                best = (n, flip, ang, t)
+    return best
+
+
+def refine(det, gaia, gaia_xy, flip, ang, t, center, cfg):
+    """Iterate the least-squares WCS fit with shrinking tolerance + outlier rejection."""
+    C = gaia_xy * np.array([-1.0, 1.0]) if flip else gaia_xy
+    R = np.array([[np.cos(ang), -np.sin(ang)], [np.sin(ang), np.cos(ang)]])
+    pred = (R @ C.T).T + t
+    d, j = cKDTree(pred).query(det, k=1)
+    idx = np.where(d < cfg["coarse_tol_px"])[0]; match = j[d < cfg["coarse_tol_px"]]
+    w = None
+    for it in range(6):
+        if len(idx) < 3:
+            break
+        w = fit_wcs_from_points((det[idx, 0], det[idx, 1]), gaia[match], proj_point=center)
+        ax, ay = w.world_to_pixel(gaia)
+        d, j = cKDTree(np.column_stack([ax, ay])).query(det, k=1)
+        tol = max(1.5, 6.0 * (0.6 ** it))
+        idx = np.where(d < tol)[0]; match = j[d < tol]
+        oo = np.argsort(d[idx]); idx = idx[oo]; match = match[oo]
+        _, uq = np.unique(match, return_index=True)
+        idx = idx[uq]; match = match[uq]
+    return w, idx, match
+
+
+def plate_solve(stars, width, height, header, cfg=None,
+                center=None, scale_arcsec=None):
+    """Offline plate solve: match the detected star pattern to Gaia DR3 and
+    least-squares refine a TAN WCS.
+
+    `header` supplies the approximate pointing centre and the plate scale.
+    Override with `center` (a SkyCoord or (ra_deg, dec_deg) tuple) and/or
+    `scale_arcsec` if the header lacks OBJCTRA/DEC or XPIXSZ/FOCALLEN.
+    Returns an astropy WCS (or None on failure)."""
+    cfg = {**PLATE_SOLVE_CFG, **(cfg or {})}
     if stars is None or len(stars) < 4:
         print("    plate solve skipped: need ~4+ stars")
         return None
-    ast = AstrometryNet()
-    if api_key:
-        ast.api_key = api_key
-    X = stars[:, 0] + 1.0
-    Y = stars[:, 1] + 1.0
-    kwargs = dict(image_width=width, image_height=height, solve_timeout=solve_timeout)
-    if scale_low and scale_high:
-        kwargs.update(scale_units=scale_units, scale_lower=scale_low, scale_upper=scale_high)
-    if center_ra is not None and center_dec is not None and radius is not None:
-        kwargs.update(center_ra=center_ra, center_dec=center_dec, radius=radius)
-    for attempt in range(1, retries + 1):
-        try:
-            wcs_header = ast.solve_from_source_list(X, Y, **kwargs)
-            if wcs_header:
-                return WCS(wcs_header)
-            print("    plate solve: no solution found")
-            return None
-        except Exception as e:
-            print(f"    plate solve attempt {attempt}/{retries} dropped: {e}")
-    print("    plate solve failed after retries (may have finished on nova — check dashboard)")
-    return None
+
+    try:
+        if center is None:
+            center = read_center(header)
+        elif not isinstance(center, SkyCoord):
+            center = SkyCoord(center[0] * u.deg, center[1] * u.deg)
+        scale = scale_arcsec if scale_arcsec else plate_scale_arcsec(header)
+    except (ValueError, KeyError, TypeError) as e:
+        print(f"    plate solve skipped: {e}")
+        return None
+
+    fov_deg = scale * max(width, height) / 3600.0
+    det = stars[:, :2].astype(float)          # (x, y) trail centroids
+    flux = stars[:, 2].astype(float)
+    print(f"    plate scale {scale:.4f} arcsec/px, FOV {fov_deg * 60:.2f} arcmin, "
+          f"centre {center.to_string('hmsdms')} (approximate is fine)")
+
+    try:
+        gaia = query_gaia(center, fov_deg, cfg)
+    except Exception as e:
+        print(f"    plate solve failed: Gaia query error: {e}")
+        return None
+    if len(gaia) < 4:
+        print(f"    plate solve failed: only {len(gaia)} Gaia stars in field")
+        return None
+    print(f"    Gaia DR3: {len(gaia)} stars in field")
+
+    w0 = make_wcs(center, scale, width, height)
+    gaia_xy = np.column_stack(w0.world_to_pixel(gaia))
+    order = np.argsort(flux)[::-1]
+    coarse = coarse_align(det[order[:cfg["n_match_stars"]]],
+                          gaia_xy[:cfg["n_match_gaia"]], cfg)
+    if coarse is None or coarse[0] < 3:
+        print("    plate solve failed: no consistent rotation in pattern match")
+        return None
+    ninl, flip, ang, t = coarse
+    print(f"    pattern lock: flip={flip}, rotation={np.rad2deg(ang):.2f} deg, "
+          f"seed inliers={ninl}")
+
+    w, idx, match = refine(det, gaia, gaia_xy, flip, ang, t, center, cfg)
+    if w is None or len(idx) < cfg["min_matches"]:
+        print(f"    plate solve failed: too few matched stars "
+              f"({0 if w is None else len(idx)}, need {cfg['min_matches']})")
+        return None
+    ax, ay = w.world_to_pixel(gaia[match])
+    rms = np.sqrt(np.mean((ax - det[idx, 0]) ** 2 + (ay - det[idx, 1]) ** 2)) * scale
+    print(f"    SOLVED offline: refined on {len(idx)} stars, RMS {rms:.3f} arcsec")
+    return w
 
 
 # ======================================================================
@@ -346,11 +507,13 @@ BORDER_MARGIN = 10
 SAT_BORDER_MARGIN = 60
 PNG_DIR    = "/Users/none/internship/png_output"
 
-# --- plate solving (astrometry.net, online) ---
+# --- plate solving (offline: Gaia DR3 pattern match — no astrometry.net) ---
+# Needs internet only for the Gaia cone query. The pointing centre and plate
+# scale come from the FITS header (OBJCTRA/DEC + XPIXSZ + FOCALLEN). If your
+# header lacks those, set the overrides below.
 DO_PLATE_SOLVE = True
-ASTROMETRY_API_KEY = ""
-PIXEL_SCALE_LOW  = None
-PIXEL_SCALE_HIGH = None
+PLATE_CENTER       = None   # override: (ra_deg, dec_deg) approximate pointing centre
+PLATE_SCALE_ARCSEC = None   # override: arcsec/pixel (else from XPIXSZ & FOCALLEN)
 
 # --- triangulation (TWO stations, same satellite, same UTC time) ---
 DO_TRIANGULATE = True        # True = process FITS_PATH + FITS_PATH_2 and triangulate
@@ -398,8 +561,9 @@ def process_one(fits_path):
     sat_radec = None
     if DO_PLATE_SOLVE and len(stars) >= 4:
         H, W = raw.shape
-        wcs = plate_solve(stars, W, H, api_key=ASTROMETRY_API_KEY,
-                          scale_low=PIXEL_SCALE_LOW, scale_high=PIXEL_SCALE_HIGH)
+        header = fits.getheader(fits_path)
+        wcs = plate_solve(stars, W, H, header,
+                          center=PLATE_CENTER, scale_arcsec=PLATE_SCALE_ARCSEC)
         if wcs is not None:
             cx, cy = np.median(stars[:, 0]), np.median(stars[:, 1])
             c = wcs.pixel_to_world(cx, cy)
